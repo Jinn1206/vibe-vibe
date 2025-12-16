@@ -46,6 +46,34 @@ master:
             - npx -y edgeone pages deploy ./docs/.vitepress/dist -n $EDGEONE_PROJECT_NAME --force -t $EDGEONE_API_TOKEN
 
 develop:
+  pull_request:
+    - name: pr-build
+      runner:
+        cpus: 8
+      docker:
+        image: docker.cnb.cool/eyre921/default-dev-env:latest
+      stages:
+        - name: prepare pnpm
+          script:
+            - corepack enable
+            - corepack prepare pnpm@10.21.0 --activate
+        - name: install
+          script:
+            - pnpm install --frozen-lockfile
+        - name: build
+          script:
+            - pnpm build
+  pull_request.mergeable:
+    - name: pr-auto-merge
+      runner:
+        cpus: 1
+      docker:
+        image: node:20
+      stages:
+        - name: auto merge
+          type: git:auto-merge
+          options:
+            mergeType: squash
   pull_request.merged:
     - <<: *docs_deploy_pipeline
       env:
