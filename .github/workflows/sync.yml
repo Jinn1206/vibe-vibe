@@ -1,165 +1,29 @@
-import os
-import sys
-import glob
-import re
-from io import StringIO
-from notion_client import Client
-from md2notion.upload import upload
-from urllib.parse import unquote
+name: Sync to Notion
 
-# --- 自动配置区域 ---
-# 获取当前脚本所在目录的上一级 (即仓库根目录)
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(CURRENT_DIR) 
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * *' # 每天自动运行
+  workflow_dispatch: # 允许手动点击按钮
 
-def find_image_root_dir():
-    """
-    自动寻找存放 images 的目录
-    优先查找: docs/public, public, docs
-    """
-    candidates = [
-        os.path.join(REPO_ROOT, "docs", "public"), # VitePress 标准路径
-        os.path.join(REPO_ROOT, "public"),         # 常见静态网站路径
-        os.path.join(REPO_ROOT, "docs"),           # 备用路径
-        REPO_ROOT                                  # 根目录
-    ]
-    
-    for path in candidates:
-        img_path = os.path.join(path, "images")
-        if os.path.exists(img_path) and os.path.isdir(img_path):
-            print(f"🔍 自动锁定图片目录: {path}")
-            return path
-            
-    print("⚠️ 未找到 images 目录，图片上传可能失败")
-    return REPO_ROOT
-
-# 自动设定图片根目录
-IMAGE_ROOT = find_image_root_dir()
-# ----------------
-
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-ROOT_PAGE_ID = os.environ.get("NOTION_PAGE_ID")
-DOCS_DIR = "docs"
-
-if not NOTION_TOKEN or not ROOT_PAGE_ID:
-    print("Error: 缺少配置 NOTION_TOKEN 或 NOTION_PAGE_ID")
-    sys.exit(1)
-
-client = Client(auth=NOTION_TOKEN)
-
-def fix_image_paths(content):
-    """
-    把 Markdown 里的相对路径图片 (/images/xx.png) 
-    替换成电脑上的绝对路径，并上传
-    """
-    def replace_link(match):
-        alt_text = match.group(1)
-        url = match.group(2)
-        
-        # 检查是不是本地图片链接 (以 /images 或 images 开头)
-        if "/images/" in url or url.startswith("images/"):
-            # 清洗路径，去掉开头的 /
-            clean_url = url.lstrip("/")
-            
-            # 拼接绝对路径
-            abs_path = os.path.join(IMAGE_ROOT, clean_url)
-            abs_path = os.path.normpath(abs_path) # 修复 Windows/Linux 路径符
-            
-            if os.path.exists(abs_path):
-                print(f"    📷 准备上传图片: {clean_url}")
-                # md2notion 要求路径不能有 URL 编码 (%20 -> 空格)
-                return f"![{alt_text}]({unquote(abs_path)})"
-            else:
-                # 尝试模糊匹配 (防止路径大小写或层级对不上的情况)
-                print(f"    ⚠️ 精确路径未找到: {abs_path}，尝试搜索...")
-                filename = os.path.basename(clean_url)
-                found = False
-                for root, dirs, files in os.walk(IMAGE_ROOT):
-                    if filename in files:
-                        abs_path = os.path.join(root, filename)
-                        print(f"    ✅ 搜索到了: {abs_path}")
-                        return f"![{alt_text}]({unquote(abs_path)})"
-                        
-                print(f"    ❌ 彻底没找到图片: {filename}")
-                return match.group(0)
-        return match.group(0)
-
-    # 正则匹配 ![xxx](yyy)
-    pattern = r"!\[(.*?)\]\((.*?)\)"
-    return re.sub(pattern, replace_link, content)
-
-def parse_file_content(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    
-    title = os.path.basename(file_path)
-    start_idx = 0
-    
-    # 1. 去除 Frontmatter
-    if lines and lines[0].strip() == '---':
-        try:
-            for i in range(1, len(lines)):
-                if lines[i].strip() == '---':
-                    start_idx = i + 1
-                    break
-        except Exception:
-            pass
-            
-    content_lines = lines[start_idx:]
-    full_content = "".join(content_lines)
-    
-    # 2. 提取标题
-    for line in content_lines:
-        if line.strip().startswith("# "):
-            title = line.strip().replace("# ", "").strip()
-            break
-    
-    # 3. 修复图片路径
-    full_content = fix_image_paths(full_content)
-            
-    return title, full_content
-
-def sync_file(file_path, parent_id):
-    real_title, cleaned_content = parse_file_content(file_path)
-    print(f"处理: {real_title}")
-    
-    # 查重
-    exists = False
-    try:
-        response = client.blocks.children.list(block_id=parent_id)
-        for block in response.get("results", []):
-            if block["type"] == "child_page" and block["child_page"]["title"] == real_title:
-                exists = True
-                print(f"  - 跳过 (已存在)")
-                break
-    except Exception as e:
-        print(f"  - 查重出错: {e}")
-
-    if not exists:
-        try:
-            new_page = client.pages.create(
-                parent={"page_id": parent_id},
-                properties={"title": [{"text": {"content": real_title}}]},
-                children=[]
-            )
-            
-            f_obj = StringIO(cleaned_content)
-            upload(f_obj, client.pages.retrieve(new_page["id"]), client)
-            print(f"  - ✅ 上传完成")
-        except Exception as e:
-            print(f"  - ❌ 失败: {e}")
-
-def main():
-    print("🚀 开始 V3.1 自动寻路同步...")
-    
-    files = glob.glob(f"{DOCS_DIR}/**/*.md", recursive=True)
-    files.sort()
-    
-    for file_path in files:
-        # 跳过非教程文件
-        if "README" in file_path or "index" in file_path:
-            continue
-        sync_file(file_path, ROOT_PAGE_ID)
-
-if __name__ == "__main__":
-    main()
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies
+        run: |
+          pip install notion-client md2notion
+          
+      - name: Run Sync Script
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
+        run: python scripts/sync_notion.py
