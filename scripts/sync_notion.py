@@ -3,7 +3,6 @@ import sys
 import glob
 import re
 import base64
-import time
 from notion_client import Client
 
 # VibeVibe 的 GitHub 仓库原始文件地址
@@ -36,12 +35,10 @@ def get_folder_display_name(folder_path):
     return default_name
 
 def parse_rich_text(text):
-    """解析 Markdown 样式"""
     if not text: return []
     rich_text = []
     pattern = re.compile(r'(\*\*.*?\*\*|`[^`]+`|\[.*?\]\(.*?\))')
     parts = pattern.split(text)
-    
     for part in parts:
         if not part: continue
         if part.startswith("**") and part.endswith("**"):
@@ -67,56 +64,57 @@ def create_notion_table_blocks(table_lines):
             cells = [c.strip() for c in clean_line.split('|')]
             rows.append(cells)
         if not rows: return []
-        
         header_row = rows[0]
         has_header = False
         body_start = 1
         if len(rows) > 1 and set(rows[1][0]) <= {'-', ':', ' '}:
              has_header = True
              body_start = 2 
-        
         table_children = []
         if has_header:
             cells_json = [parse_rich_text(c) for c in header_row]
             table_children.append({"type": "table_row", "table_row": {"cells": cells_json}})
-            
         for row in rows[body_start:]:
             cells_json = [parse_rich_text(c) for c in row]
             table_children.append({"type": "table_row", "table_row": {"cells": cells_json}})
-
-        return [{
-            "object": "block",
-            "type": "table",
-            "table": {
-                "table_width": len(header_row),
-                "has_column_header": has_header,
-                "children": table_children
-            }
-        }]
+        return [{"object": "block", "type": "table", "table": {"table_width": len(header_row), "has_column_header": has_header, "children": table_children}}]
     except:
         return [{"object": "block", "type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": "\n".join(table_lines)[:2000]}}], "language": "markdown"}}]
 
-def mermaid_to_image_url(mermaid_code):
+def process_mermaid_content(content_str):
     """
-    [暴力矫正] 强制将横向(LR)改为竖向(TD)
+    [V13 核心修复]
+    1. 强制竖排
+    2. 修复原作者的语法错误 (graph TB subgraph 挤在一行的问题)
+    3. 生成链接，如果太长则返回 None
     """
-    # 1. 简单暴力字符串替换 (防止正则失效)
-    mermaid_code = mermaid_code.replace("graph LR", "graph TD")
-    mermaid_code = mermaid_code.replace("flowchart LR", "flowchart TD")
-    # 2. 正则兜底 (处理多余空格)
-    mermaid_code = re.sub(r'(graph|flowchart)\s+(LR|RL)', r'\1 TD', mermaid_code, flags=re.IGNORECASE)
+    # 1. 强制转换方向
+    content_str = re.sub(r'(graph|flowchart)[ \t]+(LR|RL)', r'\1 TD', content_str, flags=re.IGNORECASE)
+    content_str = re.sub(r'(graph|flowchart)[ \t]+TB', r'\1 TD', content_str, flags=re.IGNORECASE)
     
-    code_bytes = mermaid_code.encode('utf-8')
+    # 2. 语法修复：确保 graph TD 后面有换行
+    # 很多错误是因为 `graph TD subgraph` 连在一起了
+    content_str = re.sub(r'(graph TD)[ \t]*(subgraph)', r'\1\n\2', content_str, flags=re.IGNORECASE)
+
+    # 3. 编码
+    code_bytes = content_str.encode('utf-8')
     base64_bytes = base64.urlsafe_b64encode(code_bytes)
     base64_str = base64_bytes.decode('ascii')
-    return f"https://mermaid.ink/img/{base64_str}"
+    
+    url = f"https://mermaid.ink/img/{base64_str}"
+    
+    # 4. [洁癖熔断] Notion 限制 URL 长度约 2000。超过则丢弃，显示为空。
+    if len(url) > 1900:
+        print(f"    ⚠️ 图片过大 (URL长度 {len(url)})，为了美观，已跳过显示。")
+        return None
+        
+    return url
 
 def markdown_to_blocks(lines):
     blocks = []
     code_mode = False
     code_content = []
     code_language = "plain text"
-    
     table_mode = False
     table_content = []
     
@@ -133,17 +131,19 @@ def markdown_to_blocks(lines):
             else:
                 code_mode = False
                 content_str = "\n".join(code_content)
-                
-                # [关键修复] 如果内容为空，给个空格，防止 Notion 报错
                 if not content_str: content_str = " "
                 
+                # Mermaid 处理逻辑：要么给图，要么不给。绝不给代码。
                 if code_language == "mermaid" or "graph " in content_str or "flowchart " in content_str:
-                    image_url = mermaid_to_image_url(content_str)
-                    blocks.append({
-                        "object": "block", "type": "image",
-                        "image": {"type": "external", "external": {"url": image_url}}
-                    })
+                    image_url = process_mermaid_content(content_str)
+                    if image_url:
+                        blocks.append({
+                            "object": "block", "type": "image",
+                            "image": {"type": "external", "external": {"url": image_url}}
+                        })
+                    # else: 如果 url 为 None，什么都不做，直接跳过 (实现"不显示代码")
                 else:
+                    # 普通代码块保留
                     blocks.append({
                         "object": "block", "type": "code",
                         "code": {
@@ -207,13 +207,11 @@ def get_parent_page_id(file_path):
     dir_path = os.path.dirname(file_path)
     if dir_path == DOCS_DIR: return ROOT_PAGE_ID
     if dir_path in folder_cache: return folder_cache[dir_path]
-    
     parent_dir = os.path.dirname(dir_path)
     if parent_dir == DOCS_DIR or parent_dir == "":
         parent_id = ROOT_PAGE_ID
     else:
         parent_id = get_parent_page_id(os.path.join(parent_dir, "placeholder.md"))
-
     folder_name = get_folder_display_name(dir_path)
     found_id = None
     try:
@@ -223,18 +221,15 @@ def get_parent_page_id(file_path):
                 found_id = block["id"]
                 break
     except: pass
-        
     if not found_id:
         print(f"📁 创建文件夹: {folder_name}")
         new_page = client.pages.create(parent={"page_id": parent_id}, properties={"title": [{"text": {"content": folder_name}}]}, icon={"emoji": "📂"})
         found_id = new_page["id"]
-    
     folder_cache[dir_path] = found_id
     return found_id
 
 def get_title_and_body(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
+    with open(file_path, "r", encoding="utf-8") as f: content = f.read()
     lines = content.splitlines()
     title = os.path.basename(file_path)
     match = re.search(r'^title:\s*["\']?(.*?)["\']?$', content, re.MULTILINE)
@@ -272,39 +267,4 @@ def sync_file(file_path, root_id):
                 return 
 
         new_page = client.pages.create(
-            parent={"page_id": parent_id},
-            properties={"title": [{"text": {"content": real_title}}]},
-            children=[]
-        )
-        
-        blocks = markdown_to_blocks(body_lines)
-        batch_size = 50
-        
-        # [核心机制] 安全批量上传
-        for i in range(0, len(blocks), batch_size):
-            batch = blocks[i:i+batch_size]
-            try:
-                client.blocks.children.append(block_id=new_page["id"], children=batch)
-                print(f"  - 批次 {i} 成功")
-            except Exception as e:
-                print(f"  ⚠️ 批次上传失败，切换到逐个安全模式: {e}")
-                # 逐个尝试，跳过坏块，确保其他内容能上传
-                for block in batch:
-                    try:
-                        client.blocks.children.append(block_id=new_page["id"], children=[block])
-                    except Exception as single_e:
-                        print(f"    ❌ 发现坏块 (已跳过): {single_e}")
-                        
-        print("  - ✅ 完成")
-    except Exception as e:
-        print(f"  - ❌ 页面创建失败: {e}")
-
-def main():
-    print("🚀 开始 V11.0 (安全模式+强制竖排)...")
-    files = glob.glob(f"{DOCS_DIR}/**/*.md", recursive=True)
-    files.sort()
-    for file_path in files:
-        sync_file(file_path, ROOT_PAGE_ID)
-
-if __name__ == "__main__":
-    main()
+            parent={"page_id": parent
