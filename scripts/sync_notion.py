@@ -3,6 +3,7 @@ import sys
 import glob
 import re
 import base64
+import time
 from notion_client import Client
 
 # VibeVibe 的 GitHub 仓库原始文件地址
@@ -36,6 +37,7 @@ def get_folder_display_name(folder_path):
 
 def parse_rich_text(text):
     """解析 Markdown 样式"""
+    if not text: return []
     rich_text = []
     pattern = re.compile(r'(\*\*.*?\*\*|`[^`]+`|\[.*?\]\(.*?\))')
     parts = pattern.split(text)
@@ -58,15 +60,14 @@ def parse_rich_text(text):
     return rich_text
 
 def create_notion_table_blocks(table_lines):
-    """原生表格生成器"""
     try:
         rows = []
         for line in table_lines:
             clean_line = line.strip().strip('|')
             cells = [c.strip() for c in clean_line.split('|')]
             rows.append(cells)
-        
         if not rows: return []
+        
         header_row = rows[0]
         has_header = False
         body_start = 1
@@ -76,15 +77,11 @@ def create_notion_table_blocks(table_lines):
         
         table_children = []
         if has_header:
-            cells_json = []
-            for cell_text in header_row:
-                cells_json.append(parse_rich_text(cell_text))
+            cells_json = [parse_rich_text(c) for c in header_row]
             table_children.append({"type": "table_row", "table_row": {"cells": cells_json}})
             
         for row in rows[body_start:]:
-            cells_json = []
-            for cell_text in row:
-                cells_json.append(parse_rich_text(cell_text))
+            cells_json = [parse_rich_text(c) for c in row]
             table_children.append({"type": "table_row", "table_row": {"cells": cells_json}})
 
         return [{
@@ -93,24 +90,22 @@ def create_notion_table_blocks(table_lines):
             "table": {
                 "table_width": len(header_row),
                 "has_column_header": has_header,
-                "has_row_header": False,
                 "children": table_children
             }
         }]
     except:
-        return [{
-            "object": "block",
-            "type": "code",
-            "code": {
-                "rich_text": [{"type": "text", "text": {"content": "\n".join(table_lines)[:2000]}}],
-                "language": "markdown"
-            }
-        }]
+        return [{"object": "block", "type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": "\n".join(table_lines)[:2000]}}], "language": "markdown"}}]
 
 def mermaid_to_image_url(mermaid_code):
-    """强力正则匹配，强制将横向(LR)改为竖向(TD)"""
+    """
+    [暴力矫正] 强制将横向(LR)改为竖向(TD)
+    """
+    # 1. 简单暴力字符串替换 (防止正则失效)
+    mermaid_code = mermaid_code.replace("graph LR", "graph TD")
+    mermaid_code = mermaid_code.replace("flowchart LR", "flowchart TD")
+    # 2. 正则兜底 (处理多余空格)
     mermaid_code = re.sub(r'(graph|flowchart)\s+(LR|RL)', r'\1 TD', mermaid_code, flags=re.IGNORECASE)
-    mermaid_code = re.sub(r'(graph|flowchart)\s+TB', r'\1 TD', mermaid_code, flags=re.IGNORECASE)
+    
     code_bytes = mermaid_code.encode('utf-8')
     base64_bytes = base64.urlsafe_b64encode(code_bytes)
     base64_str = base64_bytes.decode('ascii')
@@ -128,38 +123,32 @@ def markdown_to_blocks(lines):
     for line in lines:
         stripped = line.strip()
         
-        # --- 1. 代码块 ---
+        # --- 代码块 ---
         if stripped.startswith("```"):
             if not code_mode:
                 code_mode = True
                 lang = stripped.replace("```", "").strip().lower()
-                # [核心修复] 如果语言为空，给一个默认值 "plain text"
                 code_language = lang if lang else "plain text"
                 continue
             else:
                 code_mode = False
                 content_str = "\n".join(code_content)
                 
-                # 如果是 Mermaid，转图片
+                # [关键修复] 如果内容为空，给个空格，防止 Notion 报错
+                if not content_str: content_str = " "
+                
                 if code_language == "mermaid" or "graph " in content_str or "flowchart " in content_str:
                     image_url = mermaid_to_image_url(content_str)
                     blocks.append({
-                        "object": "block",
-                        "type": "image",
-                        "image": {
-                            "type": "external",
-                            "external": {"url": image_url}
-                        }
+                        "object": "block", "type": "image",
+                        "image": {"type": "external", "external": {"url": image_url}}
                     })
                 else:
-                    # 普通代码块
                     blocks.append({
-                        "object": "block",
-                        "type": "code",
+                        "object": "block", "type": "code",
                         "code": {
                             "rich_text": [{"type": "text", "text": {"content": content_str[:2000]}}],
-                            # [兜底] 再次确保语言不为空
-                            "language": code_language.split()[0] if code_language else "plain text"
+                            "language": code_language.split()[0]
                         }
                     })
                 code_content = []
@@ -169,7 +158,7 @@ def markdown_to_blocks(lines):
             code_content.append(line)
             continue
 
-        # --- 2. 表格 ---
+        # --- 表格 ---
         if stripped.startswith("|"):
             table_mode = True
             table_content.append(line)
@@ -181,16 +170,12 @@ def markdown_to_blocks(lines):
 
         if not stripped: continue
 
-        # --- 3. 引用 ---
+        # --- 引用 ---
         if stripped.startswith("> "):
-            blocks.append({
-                "object": "block",
-                "type": "quote",
-                "quote": {"rich_text": parse_rich_text(stripped[2:])}
-            })
+            blocks.append({"object": "block", "type": "quote", "quote": {"rich_text": parse_rich_text(stripped[2:])}})
             continue
 
-        # --- 4. 图片 ---
+        # --- 图片 ---
         img_match = re.match(r'!\[(.*?)\]\((.*?)\)', stripped)
         if img_match:
             img_url = img_match.group(2)
@@ -200,39 +185,18 @@ def markdown_to_blocks(lines):
                      clean_url = clean_url.replace("images/", "public/images/")
                      if clean_url.startswith("docs/"): clean_url = clean_url[5:]
                 img_url = f"{GITHUB_RAW_URL}/docs/{clean_url}".replace("/docs/docs/", "/docs/")
-            
-            blocks.append({
-                "object": "block",
-                "type": "image",
-                "image": {"type": "external", "external": {"url": img_url}}
-            })
+            blocks.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": img_url}}})
             continue
 
-        # --- 5. 标题与文本 ---
+        # --- 标题与文本 ---
         if stripped.startswith("## "):
-            blocks.append({
-                "object": "block",
-                "type": "heading_2",
-                "heading_2": {"rich_text": parse_rich_text(stripped[3:])}
-            })
+            blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": parse_rich_text(stripped[3:])}})
         elif stripped.startswith("### "):
-            blocks.append({
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": parse_rich_text(stripped[4:])}
-            })
+            blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": parse_rich_text(stripped[4:])}})
         elif stripped.startswith("- ") or stripped.startswith("* "):
-            blocks.append({
-                "object": "block",
-                "type": "bulleted_list_item",
-                "bulleted_list_item": {"rich_text": parse_rich_text(stripped[2:])}
-            })
+            blocks.append({"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": parse_rich_text(stripped[2:])}})
         else:
-            blocks.append({
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": parse_rich_text(stripped[:2000])}
-            })
+            blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": parse_rich_text(stripped[:2000])}})
             
     if table_mode and table_content:
         blocks.extend(create_notion_table_blocks(table_content))
@@ -262,11 +226,7 @@ def get_parent_page_id(file_path):
         
     if not found_id:
         print(f"📁 创建文件夹: {folder_name}")
-        new_page = client.pages.create(
-            parent={"page_id": parent_id},
-            properties={"title": [{"text": {"content": folder_name}}]},
-            icon={"emoji": "📂"}
-        )
+        new_page = client.pages.create(parent={"page_id": parent_id}, properties={"title": [{"text": {"content": folder_name}}]}, icon={"emoji": "📂"})
         found_id = new_page["id"]
     
     folder_cache[dir_path] = found_id
@@ -316,16 +276,31 @@ def sync_file(file_path, root_id):
             properties={"title": [{"text": {"content": real_title}}]},
             children=[]
         )
+        
         blocks = markdown_to_blocks(body_lines)
-        batch_size = 80
+        batch_size = 50
+        
+        # [核心机制] 安全批量上传
         for i in range(0, len(blocks), batch_size):
-            client.blocks.children.append(block_id=new_page["id"], children=blocks[i:i+batch_size])
-        print("  - ✅")
+            batch = blocks[i:i+batch_size]
+            try:
+                client.blocks.children.append(block_id=new_page["id"], children=batch)
+                print(f"  - 批次 {i} 成功")
+            except Exception as e:
+                print(f"  ⚠️ 批次上传失败，切换到逐个安全模式: {e}")
+                # 逐个尝试，跳过坏块，确保其他内容能上传
+                for block in batch:
+                    try:
+                        client.blocks.children.append(block_id=new_page["id"], children=[block])
+                    except Exception as single_e:
+                        print(f"    ❌ 发现坏块 (已跳过): {single_e}")
+                        
+        print("  - ✅ 完成")
     except Exception as e:
-        print(f"  - ❌: {e}")
+        print(f"  - ❌ 页面创建失败: {e}")
 
 def main():
-    print("🚀 开始 V10.0 (容错修复版) 同步...")
+    print("🚀 开始 V11.0 (安全模式+强制竖排)...")
     files = glob.glob(f"{DOCS_DIR}/**/*.md", recursive=True)
     files.sort()
     for file_path in files:
