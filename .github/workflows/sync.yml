@@ -1,29 +1,196 @@
-name: Sync to Notion
+import os
+import sys
+import glob
+import re
+from notion_client import Client
 
-on:
-  push:
-    branches: [ main ]
-  schedule:
-    - cron: '0 0 * * *' # 每天自动运行
-  workflow_dispatch: # 允许手动点击按钮
+# --- 核心配置 ---
+# VibeVibe 的 GitHub 仓库原始文件地址 (用于图片显示)
+# 这样我们就不需要上传图片，直接用 GitHub 的图床，速度快且稳
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/datawhalechina/vibe-vibe/main"
+# ----------------
 
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-          
-      - name: Install dependencies
-        run: |
-          pip install notion-client md2notion
-          
-      - name: Run Sync Script
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
-        run: python scripts/sync_notion.py
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
+ROOT_PAGE_ID = os.environ.get("NOTION_PAGE_ID")
+DOCS_DIR = "docs"
+
+if not NOTION_TOKEN or not ROOT_PAGE_ID:
+    print("Error: 缺少 NOTION_TOKEN 或 NOTION_PAGE_ID")
+    sys.exit(1)
+
+client = Client(auth=NOTION_TOKEN)
+
+def get_title_and_body(file_path):
+    """读取文件，提取标题和正文"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    
+    title = os.path.basename(file_path)
+    body_lines = lines
+    
+    # 1. 去除 Frontmatter (--- ... ---)
+    if lines and lines[0].strip() == '---':
+        try:
+            for i in range(1, len(lines)):
+                if lines[i].strip() == '---':
+                    body_lines = lines[i+1:]
+                    break
+        except:
+            pass
+            
+    # 2. 提取真正的标题 (# 开头)
+    final_body = []
+    found_title = False
+    for line in body_lines:
+        # 如果找到第一个一级标题，且还没定标题，就用它
+        if not found_title and line.strip().startswith("# "):
+            title = line.strip().replace("# ", "").strip()
+            found_title = True
+            continue # 标题行不放入正文
+        final_body.append(line)
+        
+    return title, final_body
+
+def markdown_to_blocks(lines):
+    """
+    [手写翻译器] 将 Markdown 行转换为 Notion Block 格式
+    支持：标题、列表、代码块、图片、段落
+    """
+    blocks = []
+    code_mode = False
+    code_content = []
+    code_language = "plain text"
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # --- 1. 处理代码块 ---
+        if stripped.startswith("```"):
+            if not code_mode:
+                code_mode = True
+                code_language = stripped.replace("```", "").strip() or "javascript"
+                continue
+            else:
+                code_mode = False
+                # 代码块结束，打包添加
+                blocks.append({
+                    "object": "block",
+                    "type": "code",
+                    "code": {
+                        "rich_text": [{"type": "text", "text": {"content": "".join(code_content)[:2000]}}],
+                        "language": code_language.split()[0] if code_language else "plain text"
+                    }
+                })
+                code_content = []
+                continue
+        
+        if code_mode:
+            code_content.append(line)
+            continue
+            
+        if not stripped: continue # 跳过空行
+
+        # --- 2. 处理图片 ---
+        # 匹配 ![alt](url)
+        img_match = re.match(r'!\[(.*?)\]\((.*?)\)', stripped)
+        if img_match:
+            img_url = img_match.group(2)
+            # 如果是本地图片 (/images/xx.png)，转换成 GitHub 在线链接
+            if not img_url.startswith("http"):
+                clean_url = img_url.lstrip("/")
+                # 拼接 GitHub Raw 地址
+                img_url = f"{GITHUB_RAW_URL}/docs/public/{clean_url}" if "public" not in clean_url else f"{GITHUB_RAW_URL}/docs/{clean_url}"
+                # 简单修正路径：有些文章写的是 /images/ 但实际在 docs/public/images
+                if "/images/" in img_url and "public" not in img_url:
+                     img_url = img_url.replace("/docs/images/", "/docs/public/images/")
+
+            blocks.append({
+                "object": "block",
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": {"url": img_url}
+                }
+            })
+            continue
+
+        # --- 3. 处理标题 ---
+        if stripped.startswith("## "):
+            blocks.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": [{"type": "text", "text": {"content": stripped[3:]}}]}
+            })
+        elif stripped.startswith("### "):
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": stripped[4:]}}]}
+            })
+        # --- 4. 处理列表 ---
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": stripped[2:]}}]}
+            })
+        # --- 5. 普通段落 ---
+        else:
+            # 简单的截断防止过长报错
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": stripped[:2000]}}]}
+            })
+            
+    return blocks
+
+def sync_file(file_path, parent_id):
+    real_title, body_lines = get_title_and_body(file_path)
+    print(f"处理: {real_title}")
+    
+    # 查重
+    try:
+        response = client.blocks.children.list(block_id=parent_id)
+        for block in response.get("results", []):
+            if block["type"] == "child_page" and block["child_page"]["title"] == real_title:
+                print(f"  - 跳过 (已存在)")
+                return # 遇到已存在的直接结束，不重复创建
+    except:
+        pass
+
+    try:
+        # 1. 创建页面
+        new_page = client.pages.create(
+            parent={"page_id": parent_id},
+            properties={"title": [{"text": {"content": real_title}}]},
+            children=[]
+        )
+        page_id = new_page["id"]
+        
+        # 2. 转换内容
+        blocks = markdown_to_blocks(body_lines)
+        
+        # 3. 分批上传 (Notion 限制每次 100 个 block)
+        # 倒序上传太麻烦，我们正序分批
+        batch_size = 90
+        for i in range(0, len(blocks), batch_size):
+            batch = blocks[i:i+batch_size]
+            client.blocks.children.append(block_id=page_id, children=batch)
+            print(f"  - 上传批次 {i//batch_size + 1}")
+            
+        print(f"  - ✅ 成功")
+    except Exception as e:
+        print(f"  - ❌ 失败: {e}")
+
+def main():
+    print("🚀 开始 V4.0 原生同步 (GitHub图床版)...")
+    files = glob.glob(f"{DOCS_DIR}/**/*.md", recursive=True)
+    files.sort()
+    
+    for file_path in files:
+        if "README" in file_path or "index" in file_path: continue
+        sync_file(file_path, ROOT_PAGE_ID)
+
+if __name__ == "__main__":
+    main()
