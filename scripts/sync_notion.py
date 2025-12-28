@@ -17,75 +17,51 @@ if not NOTION_TOKEN or not ROOT_PAGE_ID:
 
 client = Client(auth=NOTION_TOKEN)
 
-# 缓存文件夹对应的 Page ID，避免重复查找创建
-# 格式: { "docs/Basic": "page_id_123", "docs/Basic/01-Chapter": "page_id_456" }
 folder_cache = {}
 
+def get_folder_display_name(folder_path):
+    """读取文件夹下的 index.md 获取中文标题"""
+    default_name = os.path.basename(folder_path)
+    for index_file in ["index.md", "README.md", "readme.md"]:
+        path = os.path.join(folder_path, index_file)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                match = re.search(r'^title:\s*["\']?(.*?)["\']?$', content, re.MULTILINE)
+                if match: return match.group(1).strip()
+                match = re.search(r'^#\s+(.*?)$', content, re.MULTILINE)
+                if match: return match.group(1).strip()
+            except: pass
+    return default_name
+
 def parse_rich_text(text):
-    """
-    [高级解析] 将文本中的 Markdown 符号 (**粗体**, `代码`) 转换为 Notion Rich Text 对象
-    """
+    """简单的 Markdown 样式解析"""
     rich_text = []
-    # 正则匹配：**粗体**, `代码`, 或者普通文本
-    # 这一步比较简单，只处理了最常见的粗体和行内代码，防止过于复杂出错
     pattern = re.compile(r'(\*\*.*?\*\*|`[^`]+`)')
     parts = pattern.split(text)
-    
     for part in parts:
         if not part: continue
-        
         if part.startswith("**") and part.endswith("**"):
-            # 粗体
-            content = part[2:-2]
-            rich_text.append({
-                "type": "text",
-                "text": {"content": content},
-                "annotations": {"bold": True}
-            })
+            rich_text.append({"type": "text", "text": {"content": part[2:-2]}, "annotations": {"bold": True}})
         elif part.startswith("`") and part.endswith("`"):
-            # 行内代码
-            content = part[1:-1]
-            rich_text.append({
-                "type": "text",
-                "text": {"content": content},
-                "annotations": {"code": True}
-            })
+            rich_text.append({"type": "text", "text": {"content": part[1:-1]}, "annotations": {"code": True}})
         else:
-            # 普通文本
-            rich_text.append({
-                "type": "text",
-                "text": {"content": part}
-            })
+            rich_text.append({"type": "text", "text": {"content": part}})
     return rich_text
 
 def get_parent_page_id(file_path):
-    """
-    根据文件路径，递归创建/查找 Notion 中的父文件夹页面
-    例如: docs/Basic/01.md -> 会先确保 'Basic' 页面存在，并返回它的 ID
-    """
-    # 获取文件所在的目录路径 (例如 docs/Basic/02-mindset)
     dir_path = os.path.dirname(file_path)
+    if dir_path == DOCS_DIR: return ROOT_PAGE_ID
+    if dir_path in folder_cache: return folder_cache[dir_path]
     
-    # 如果就在 docs 根目录下，直接返回根页面 ID
-    if dir_path == DOCS_DIR:
-        return ROOT_PAGE_ID
-        
-    # 如果已经缓存过，直接返回
-    if dir_path in folder_cache:
-        return folder_cache[dir_path]
-    
-    # 递归查找上一级目录
     parent_dir = os.path.dirname(dir_path)
     if parent_dir == DOCS_DIR or parent_dir == "":
         parent_id = ROOT_PAGE_ID
     else:
-        # 递归调用
         parent_id = get_parent_page_id(os.path.join(parent_dir, "placeholder.md"))
 
-    # 当前文件夹的名字 (作为页面标题)
-    folder_name = os.path.basename(dir_path)
-    
-    # 在父页面下查找是否已存在该文件夹页面
+    folder_name = get_folder_display_name(dir_path)
     found_id = None
     try:
         response = client.blocks.children.list(block_id=parent_id)
@@ -93,29 +69,34 @@ def get_parent_page_id(file_path):
             if block["type"] == "child_page" and block["child_page"]["title"] == folder_name:
                 found_id = block["id"]
                 break
-    except:
-        pass
+    except: pass
         
     if not found_id:
-        print(f"📁 创建目录页面: {folder_name}")
+        print(f"📁 创建文件夹: {folder_name}")
         new_page = client.pages.create(
             parent={"page_id": parent_id},
             properties={"title": [{"text": {"content": folder_name}}]},
-            icon={"emoji": "📂"} # 给文件夹加个图标
+            icon={"emoji": "📂"}
         )
         found_id = new_page["id"]
     
-    # 存入缓存
     folder_cache[dir_path] = found_id
     return found_id
 
 def get_title_and_body(file_path):
     with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    
+        content = f.read()
+        
+    lines = content.splitlines()
     title = os.path.basename(file_path)
-    body_lines = lines
     
+    # 1. 优先从 Frontmatter 获取完整标题
+    frontmatter_title_match = re.search(r'^title:\s*["\']?(.*?)["\']?$', content, re.MULTILINE)
+    if frontmatter_title_match:
+        title = frontmatter_title_match.group(1).strip()
+
+    body_lines = lines
+    # 去除 Frontmatter
     if lines and lines[0].strip() == '---':
         try:
             for i in range(1, len(lines)):
@@ -124,15 +105,27 @@ def get_title_and_body(file_path):
                     break
         except: pass
             
-    final_body = []
-    found_title = False
-    for line in body_lines:
-        if not found_title and line.strip().startswith("# "):
-            title = line.strip().replace("# ", "").strip()
-            found_title = True
-            continue 
-        final_body.append(line)
-    return title, final_body
+    # 如果没有 Frontmatter 标题，尝试提取 # 标题
+    if not frontmatter_title_match:
+        found_title = False
+        final_body = []
+        for line in body_lines:
+            if not found_title and line.strip().startswith("# "):
+                title = line.strip().replace("# ", "").strip()
+                found_title = True
+                continue 
+            final_body.append(line)
+        return title, final_body
+    else:
+        # 如果用了 Frontmatter 标题，正文里的 # 标题可能重复，过滤掉第一个 #
+        final_body = []
+        first_h1_skipped = False
+        for line in body_lines:
+            if not first_h1_skipped and line.strip().startswith("# "):
+                first_h1_skipped = True
+                continue
+            final_body.append(line)
+        return title, final_body
 
 def markdown_to_blocks(lines):
     blocks = []
@@ -140,48 +133,84 @@ def markdown_to_blocks(lines):
     code_content = []
     code_language = "plain text"
     
+    # [新功能] 表格模式
+    table_mode = False
+    table_content = []
+    
     for line in lines:
         stripped = line.strip()
         
-        # --- 处理代码块 (含 Mermaid 修复) ---
+        # --- 1. 处理代码块 ---
         if stripped.startswith("```"):
             if not code_mode:
                 code_mode = True
                 lang = stripped.replace("```", "").strip().lower()
-                # 修复: 明确标记 mermaid，否则 Notion 无法渲染图表
                 code_language = lang if lang else "plain text"
                 continue
             else:
                 code_mode = False
+                content_str = "\n".join(code_content)
+                # 修复 Mermaid 方向
+                if code_language == "mermaid" or "graph LR" in content_str:
+                    code_language = "mermaid"
+                    content_str = content_str.replace("graph LR", "graph TD")
+
                 blocks.append({
                     "object": "block",
                     "type": "code",
                     "code": {
-                        "rich_text": [{"type": "text", "text": {"content": "".join(code_content)[:2000]}}],
-                        "language": code_language.split()[0]  # Notion 只接受一个单词
+                        "rich_text": [{"type": "text", "text": {"content": content_str[:2000]}}],
+                        "language": code_language.split()[0]
                     }
                 })
                 code_content = []
                 continue
         
         if code_mode:
-            code_content.append(line)
+            code_content.append(line) # 保留缩进
             continue
-            
+
+        # --- 2. 处理表格 (转换为 Markdown 代码块以保持格式) ---
+        if stripped.startswith("|"):
+            table_mode = True
+            table_content.append(line)
+            continue
+        
+        if table_mode:
+            # 表格结束了
+            table_mode = False
+            blocks.append({
+                "object": "block",
+                "type": "code",
+                "code": {
+                    "rich_text": [{"type": "text", "text": {"content": "\n".join(table_content)[:2000]}}],
+                    "language": "markdown" # 用 Markdown 语法高亮
+                }
+            })
+            table_content = []
+
         if not stripped: continue
 
-        # --- 图片处理 ---
+        # --- 3. 处理引用 (> text) ---
+        if stripped.startswith("> "):
+            blocks.append({
+                "object": "block",
+                "type": "quote",
+                "quote": {"rich_text": parse_rich_text(stripped[2:])}
+            })
+            continue
+
+        # --- 4. 图片处理 ---
         img_match = re.match(r'!\[(.*?)\]\((.*?)\)', stripped)
         if img_match:
             img_url = img_match.group(2)
             if not img_url.startswith("http"):
                 clean_url = img_url.lstrip("/")
-                base_path = "docs/public" if "public" not in clean_url else "docs"
                 if "/images/" in clean_url and "public" not in clean_url:
                      clean_url = clean_url.replace("images/", "public/images/")
                      if clean_url.startswith("docs/"): clean_url = clean_url[5:]
                 img_url = f"{GITHUB_RAW_URL}/docs/{clean_url}".replace("/docs/docs/", "/docs/")
-
+            
             blocks.append({
                 "object": "block",
                 "type": "image",
@@ -189,7 +218,7 @@ def markdown_to_blocks(lines):
             })
             continue
 
-        # --- 标题与文本 (接入 Rich Text 解析) ---
+        # --- 5. 标题与文本 ---
         if stripped.startswith("## "):
             blocks.append({
                 "object": "block",
@@ -215,49 +244,53 @@ def markdown_to_blocks(lines):
                 "paragraph": {"rich_text": parse_rich_text(stripped[:2000])}
             })
             
+    # 防止文件末尾的表格未提交
+    if table_mode and table_content:
+        blocks.append({
+            "object": "block",
+            "type": "code",
+            "code": {
+                "rich_text": [{"type": "text", "text": {"content": "\n".join(table_content)[:2000]}}],
+                "language": "markdown"
+            }
+        })
+            
     return blocks
 
 def sync_file(file_path, root_id):
-    # 1. 智能获取父页面 (解决目录结构问题)
-    # 脚本会自动去 Notion 创建 "Basic", "Chapter-1" 等文件夹页面
     parent_id = get_parent_page_id(file_path)
-    
     real_title, body_lines = get_title_and_body(file_path)
-    print(f"处理: {real_title} (父页面: {parent_id})")
+    
+    if "README" in file_path or "index" in file_path: return
+
+    print(f"处理: {real_title}")
     
     try:
-        # 查重
-        exists = False
         response = client.blocks.children.list(block_id=parent_id)
         for block in response.get("results", []):
             if block["type"] == "child_page" and block["child_page"]["title"] == real_title:
-                print("  - 跳过")
                 return 
 
-        # 创建页面
         new_page = client.pages.create(
             parent={"page_id": parent_id},
             properties={"title": [{"text": {"content": real_title}}]},
             children=[]
         )
         
-        # 上传内容
         blocks = markdown_to_blocks(body_lines)
         batch_size = 90
         for i in range(0, len(blocks), batch_size):
             client.blocks.children.append(block_id=new_page["id"], children=blocks[i:i+batch_size])
-        print("  - ✅ 成功")
+        print("  - ✅")
             
     except Exception as e:
-        print(f"  - ❌ 失败: {e}")
+        print(f"  - ❌: {e}")
 
 def main():
-    print("🚀 开始 V5.0 终极同步...")
+    print("🚀 开始 V6.1 查漏补缺版...")
     files = glob.glob(f"{DOCS_DIR}/**/*.md", recursive=True)
     files.sort()
-    
     for file_path in files:
-        if "README" in file_path or "index" in file_path: continue
         sync_file(file_path, ROOT_PAGE_ID)
 
 if __name__ == "__main__":
