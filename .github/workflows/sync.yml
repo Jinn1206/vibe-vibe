@@ -1,0 +1,29 @@
+name: Sync to Notion
+
+on:
+  push:
+    branches: [ main ] # 当代码有更新时触发
+  schedule:
+    - cron: '0 0 * * *' # 每天凌晨0点自动检查一次
+  workflow_dispatch: # 允许你手动点击按钮触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies
+        run: |
+          pip install notion-client md2notion
+          
+      - name: Run Sync Script
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
+        run: python scripts/sync_notion.py
