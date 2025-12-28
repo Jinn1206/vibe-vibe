@@ -1,21 +1,39 @@
 import os
 import sys
-import glob
-import re
-import base64
-from notion_client import Client
+import traceback
 
-# VibeVibe 的 GitHub 仓库原始文件地址
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/datawhalechina/vibe-vibe/main"
+print("🔍 正在启动 V13.1 诊断模式...")
 
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-ROOT_PAGE_ID = os.environ.get("NOTION_PAGE_ID")
-DOCS_DIR = "docs"
-
-if not NOTION_TOKEN or not ROOT_PAGE_ID:
-    print("Error: 缺少配置")
+# 1. 检查依赖库
+try:
+    import glob
+    import re
+    import base64
+    from notion_client import Client
+    print("✅ 依赖库加载成功")
+except ImportError as e:
+    print(f"❌ 依赖库缺失: {e}")
     sys.exit(1)
 
+# 2. 检查环境变量
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
+ROOT_PAGE_ID = os.environ.get("NOTION_PAGE_ID")
+
+if not NOTION_TOKEN:
+    print("❌ 错误: 找不到 NOTION_TOKEN。请检查 GitHub Settings -> Secrets 是否配置正确，或者 YAML 文件里的 env 部分是否缺失。")
+    sys.exit(1)
+else:
+    print(f"✅ NOTION_TOKEN 已读取 (长度: {len(NOTION_TOKEN)})")
+
+if not ROOT_PAGE_ID:
+    print("❌ 错误: 找不到 NOTION_PAGE_ID。")
+    sys.exit(1)
+else:
+    print(f"✅ NOTION_PAGE_ID 已读取: {ROOT_PAGE_ID}")
+
+# --- 以下是核心逻辑 ---
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/datawhalechina/vibe-vibe/main"
+DOCS_DIR = "docs"
 client = Client(auth=NOTION_TOKEN)
 folder_cache = {}
 
@@ -82,32 +100,16 @@ def create_notion_table_blocks(table_lines):
         return [{"object": "block", "type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": "\n".join(table_lines)[:2000]}}], "language": "markdown"}}]
 
 def process_mermaid_content(content_str):
-    """
-    [V13 核心修复]
-    1. 强制竖排
-    2. 修复原作者的语法错误 (graph TB subgraph 挤在一行的问题)
-    3. 生成链接，如果太长则返回 None
-    """
-    # 1. 强制转换方向
     content_str = re.sub(r'(graph|flowchart)[ \t]+(LR|RL)', r'\1 TD', content_str, flags=re.IGNORECASE)
     content_str = re.sub(r'(graph|flowchart)[ \t]+TB', r'\1 TD', content_str, flags=re.IGNORECASE)
-    
-    # 2. 语法修复：确保 graph TD 后面有换行
-    # 很多错误是因为 `graph TD subgraph` 连在一起了
     content_str = re.sub(r'(graph TD)[ \t]*(subgraph)', r'\1\n\2', content_str, flags=re.IGNORECASE)
-
-    # 3. 编码
     code_bytes = content_str.encode('utf-8')
     base64_bytes = base64.urlsafe_b64encode(code_bytes)
     base64_str = base64_bytes.decode('ascii')
-    
     url = f"https://mermaid.ink/img/{base64_str}"
-    
-    # 4. [洁癖熔断] Notion 限制 URL 长度约 2000。超过则丢弃，显示为空。
     if len(url) > 1900:
-        print(f"    ⚠️ 图片过大 (URL长度 {len(url)})，为了美观，已跳过显示。")
+        print(f"    ⚠️ 图片过大 (URL长度 {len(url)})，跳过显示。")
         return None
-        
     return url
 
 def markdown_to_blocks(lines):
@@ -117,11 +119,8 @@ def markdown_to_blocks(lines):
     code_language = "plain text"
     table_mode = False
     table_content = []
-    
     for line in lines:
         stripped = line.strip()
-        
-        # --- 代码块 ---
         if stripped.startswith("```"):
             if not code_mode:
                 code_mode = True
@@ -132,33 +131,17 @@ def markdown_to_blocks(lines):
                 code_mode = False
                 content_str = "\n".join(code_content)
                 if not content_str: content_str = " "
-                
-                # Mermaid 处理逻辑：要么给图，要么不给。绝不给代码。
                 if code_language == "mermaid" or "graph " in content_str or "flowchart " in content_str:
                     image_url = process_mermaid_content(content_str)
                     if image_url:
-                        blocks.append({
-                            "object": "block", "type": "image",
-                            "image": {"type": "external", "external": {"url": image_url}}
-                        })
-                    # else: 如果 url 为 None，什么都不做，直接跳过 (实现"不显示代码")
+                        blocks.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": image_url}}})
                 else:
-                    # 普通代码块保留
-                    blocks.append({
-                        "object": "block", "type": "code",
-                        "code": {
-                            "rich_text": [{"type": "text", "text": {"content": content_str[:2000]}}],
-                            "language": code_language.split()[0]
-                        }
-                    })
+                    blocks.append({"object": "block", "type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": content_str[:2000]}}], "language": code_language.split()[0]}})
                 code_content = []
                 continue
-        
         if code_mode:
             code_content.append(line)
             continue
-
-        # --- 表格 ---
         if stripped.startswith("|"):
             table_mode = True
             table_content.append(line)
@@ -167,15 +150,10 @@ def markdown_to_blocks(lines):
             table_mode = False
             blocks.extend(create_notion_table_blocks(table_content))
             table_content = []
-
         if not stripped: continue
-
-        # --- 引用 ---
         if stripped.startswith("> "):
             blocks.append({"object": "block", "type": "quote", "quote": {"rich_text": parse_rich_text(stripped[2:])}})
             continue
-
-        # --- 图片 ---
         img_match = re.match(r'!\[(.*?)\]\((.*?)\)', stripped)
         if img_match:
             img_url = img_match.group(2)
@@ -187,8 +165,6 @@ def markdown_to_blocks(lines):
                 img_url = f"{GITHUB_RAW_URL}/docs/{clean_url}".replace("/docs/docs/", "/docs/")
             blocks.append({"object": "block", "type": "image", "image": {"type": "external", "external": {"url": img_url}}})
             continue
-
-        # --- 标题与文本 ---
         if stripped.startswith("## "):
             blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": parse_rich_text(stripped[3:])}})
         elif stripped.startswith("### "):
@@ -197,10 +173,8 @@ def markdown_to_blocks(lines):
             blocks.append({"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": parse_rich_text(stripped[2:])}})
         else:
             blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": parse_rich_text(stripped[:2000])}})
-            
     if table_mode and table_content:
         blocks.extend(create_notion_table_blocks(table_content))
-            
     return blocks
 
 def get_parent_page_id(file_path):
@@ -254,17 +228,50 @@ def get_title_and_body(file_path):
     return title, body_lines
 
 def sync_file(file_path, root_id):
-    parent_id = get_parent_page_id(file_path)
-    real_title, body_lines = get_title_and_body(file_path)
-    if "README" in file_path or "index" in file_path: return
-
-    print(f"处理: {real_title}")
-    
     try:
+        parent_id = get_parent_page_id(file_path)
+        real_title, body_lines = get_title_and_body(file_path)
+        if "README" in file_path or "index" in file_path: return
+        print(f"处理: {real_title}")
+        
         response = client.blocks.children.list(block_id=parent_id)
         for block in response.get("results", []):
             if block["type"] == "child_page" and block["child_page"]["title"] == real_title:
                 return 
 
         new_page = client.pages.create(
-            parent={"page_id": parent
+            parent={"page_id": parent_id},
+            properties={"title": [{"text": {"content": real_title}}]},
+            children=[]
+        )
+        blocks = markdown_to_blocks(body_lines)
+        batch_size = 50
+        for i in range(0, len(blocks), batch_size):
+            batch = blocks[i:i+batch_size]
+            try:
+                client.blocks.children.append(block_id=new_page["id"], children=batch)
+            except Exception as e:
+                print(f"  ⚠️ 批次失败，尝试逐个上传: {e}")
+                for block in batch:
+                    try:
+                        client.blocks.children.append(block_id=new_page["id"], children=[block])
+                    except: pass 
+        print("  - ✅")
+    except Exception as e:
+        print(f"  ❌ 同步文件失败 {file_path}: {e}")
+        # traceback.print_exc()
+
+def main():
+    print("🚀 开始 V13.1 ...")
+    try:
+        files = glob.glob(f"{DOCS_DIR}/**/*.md", recursive=True)
+        files.sort()
+        for file_path in files:
+            sync_file(file_path, ROOT_PAGE_ID)
+    except Exception as e:
+        print(f"❌ 主程序崩溃: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
