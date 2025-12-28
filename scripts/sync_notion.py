@@ -108,18 +108,12 @@ def create_notion_table_blocks(table_lines):
         }]
 
 def mermaid_to_image_url(mermaid_code):
-    """
-    [新魔法] 将 Mermaid 代码转为 mermaid.ink 的图片链接
-    """
-    # 1. 强制竖排
-    mermaid_code = mermaid_code.replace("graph LR", "graph TD")
-    
-    # 2. Base64 编码
+    """强力正则匹配，强制将横向(LR)改为竖向(TD)"""
+    mermaid_code = re.sub(r'(graph|flowchart)\s+(LR|RL)', r'\1 TD', mermaid_code, flags=re.IGNORECASE)
+    mermaid_code = re.sub(r'(graph|flowchart)\s+TB', r'\1 TD', mermaid_code, flags=re.IGNORECASE)
     code_bytes = mermaid_code.encode('utf-8')
     base64_bytes = base64.urlsafe_b64encode(code_bytes)
     base64_str = base64_bytes.decode('ascii')
-    
-    # 3. 生成图片 URL
     return f"https://mermaid.ink/img/{base64_str}"
 
 def markdown_to_blocks(lines):
@@ -139,14 +133,15 @@ def markdown_to_blocks(lines):
             if not code_mode:
                 code_mode = True
                 lang = stripped.replace("```", "").strip().lower()
+                # [核心修复] 如果语言为空，给一个默认值 "plain text"
                 code_language = lang if lang else "plain text"
                 continue
             else:
                 code_mode = False
                 content_str = "\n".join(code_content)
                 
-                # [核心修改] 如果是 Mermaid，直接转成图片块，而不是代码块
-                if code_language == "mermaid" or "graph LR" in content_str or "graph TD" in content_str:
+                # 如果是 Mermaid，转图片
+                if code_language == "mermaid" or "graph " in content_str or "flowchart " in content_str:
                     image_url = mermaid_to_image_url(content_str)
                     blocks.append({
                         "object": "block",
@@ -157,16 +152,16 @@ def markdown_to_blocks(lines):
                         }
                     })
                 else:
-                    # 普通代码块保持原样
+                    # 普通代码块
                     blocks.append({
                         "object": "block",
                         "type": "code",
                         "code": {
                             "rich_text": [{"type": "text", "text": {"content": content_str[:2000]}}],
-                            "language": code_language.split()[0]
+                            # [兜底] 再次确保语言不为空
+                            "language": code_language.split()[0] if code_language else "plain text"
                         }
                     })
-                
                 code_content = []
                 continue
         
@@ -330,7 +325,7 @@ def sync_file(file_path, root_id):
         print(f"  - ❌: {e}")
 
 def main():
-    print("🚀 开始 V8.0 (纯净图片版) 同步...")
+    print("🚀 开始 V10.0 (容错修复版) 同步...")
     files = glob.glob(f"{DOCS_DIR}/**/*.md", recursive=True)
     files.sort()
     for file_path in files:
