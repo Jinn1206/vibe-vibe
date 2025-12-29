@@ -44,6 +44,13 @@ master:
             - npx -y edgeone pages deploy ./docs/.vitepress/dist -n $EDGEONE_PROJECT_NAME --force -t $EDGEONE_API_TOKEN
 
 develop:
+  push:
+    - <<: *docs_deploy_pipeline
+      env:
+        EDGEONE_PROJECT_NAME: vibe-vibe-develop
+      stages:
+        - *docs_build_stage
+        - *edgeone_deploy_stage
   pull_request:
     - name: pr-build
       runner:
